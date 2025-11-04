@@ -1,8 +1,12 @@
 import os, json
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+import re
+from langchain.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
+from fastapi import UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.responses import JSONResponse
 from utils.pdf_parser import extract_text_from_pdf_stream
-from services.brand_service import extract_requirements_from_text
+from services.brand_service import extract_requirements_from_text, extract_requirements_from_brief
 from services.prompt_service import combine_prompts
 from services.llm_service import run_llm_instruction
 
@@ -93,6 +97,98 @@ async def chat(brand: str = Form(None), user_input: str = Form(...), provider: s
         with open(path, "r", encoding="utf-8") as f:
             brand_data = json.load(f)
             combined = combine_prompts(SYSTEM_PROMPT, brand_data["prompt"])
+    user_input = extract_requirements_from_brief(user_input, provider=provider)
     user_input = user_input + "\n Do not explain the rules in your output — just produce the text. Explanations, commentaries, or notes ARE NOT ALLOWED."
     response = run_llm_instruction(combined, user_input, provider=provider)
     return JSONResponse({"response": response})
+
+
+@app.post("/analyze_article")
+async def analyze_article(
+    brand: str = Form(...),
+    article: str = Form(...),
+):
+    path = brand_path(brand)  # explanation: Get path to brand-specific prompt JSON file.
+
+    if not os.path.exists(path):
+        combined_guidelines = combine_prompts(SYSTEM_PROMPT, "")  # explanation: Use system prompt if brand prompt missing.
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            brand_data = json.load(f)  # explanation: Load brand-specific JSON data.
+            combined_guidelines = brand_data["prompt"]  # explanation: Extract the brand prompt.
+
+    # Prompt template instructs LLM to return text blocks paired with explanations
+    prompt_template = ChatPromptTemplate.from_template("""
+You are a Brand Compliance & Editorial Alignment Analyst. Compare the ARTICLE with the BRAND GUIDELINES.
+COMBINED BRAND GUIDELINES: {combined_guidelines}
+ARTICLE: {article}
+Analyze the article in full context (tone, style, content). For each part that does NOT align with the brand, quote the text and provide a concise explanation why it is off-brand. Output strictly as valid JSON in this format:
+{{
+  "satisfy_brandbook": true or false,
+  "text_blocks": [
+    {{
+      "block": "Problematic text here",
+      "explanation": "Why it is off-brand"
+    }}
+  ]
+}}
+If fully aligned, return "text_blocks": [] and "satisfy_brandbook": true.
+""")  # explanation: LLM is instructed to produce JSON with embedded explanations per block.
+
+    llm = ChatOpenAI(model="gpt-5-2025-08-07", temperature=1)  # explanation: Initialize GPT-5.
+    chain = prompt_template | llm  # explanation: Connect prompt template to LLM.
+
+    response = chain.invoke({
+        "combined_guidelines": combined_guidelines,
+        "article": article
+    })  # explanation: Run LLM with article and guidelines.
+
+    raw_output = getattr(response, "content", str(response))  # explanation: Extract raw text from LLM response.
+    cleaned = re.sub(r"^```(?:json)?|```$", "", raw_output.strip(), flags=re.MULTILINE).strip()
+    # explanation: Remove code fences and whitespace.
+
+    try:
+        parsed = json.loads(cleaned)  # explanation: Parse JSON string into dict.
+    except Exception:
+        parsed = {
+            "satisfy_brandbook": False,
+            "text_blocks": [{"block": "Unable to parse model output.", "explanation": f"Raw cleaned output:\n{cleaned}"}]
+        }  # explanation: Fallback if parsing fails, using embedded block + explanation.
+
+    parsed.setdefault("text_blocks", [])  # explanation: Ensure key exists even if empty.
+
+    return JSONResponse(parsed)  # explanation: Return final JSON with embedded explanations.
+
+
+@app.get("/brand/{name}")
+def get_brand(name: str):
+    """
+    Retrieve a brand's stored prompt and basic info.
+    """
+    path = brand_path(name)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Brand not found")
+    with open(path, "r", encoding="utf-8") as f:
+        brand_data = json.load(f)
+    return {"name": brand_data["name"], "prompt": brand_data["prompt"],
+            "raw_text_preview": brand_data["raw_text"][:500]}
+
+
+@app.post("/brand/{name}/update-prompt")
+def update_brand_prompt(name: str, prompt: str = Body(..., embed=True)):
+    """
+    Update the prompt for an existing brand.
+    """
+    path = brand_path(name)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Brand not found")
+
+    with open(path, "r", encoding="utf-8") as f:
+        brand_data = json.load(f)
+
+    brand_data["prompt"] = prompt
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(brand_data, f, ensure_ascii=False, indent=2)
+
+    return {"message": "Brand prompt updated successfully", "name": name}
